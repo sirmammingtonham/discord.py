@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -59,7 +59,6 @@ try:
     has_nacl = True
 except ImportError:
     has_nacl = False
-
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +118,7 @@ class VoiceClient:
         self._reader = None
         self.encoder = None
         self._ssrcs = Bidict()
+        self._lite_nonce = 0
 
     warn_nacl = not has_nacl
     supported_modes = (
@@ -169,6 +169,7 @@ class VoiceClient:
         guild_id, channel_id = self.channel._get_voice_state_pair()
         self._handshake_complete.clear()
         await self.main_ws.voice_state(guild_id, None, self_mute=True)
+        self._handshaking = False
 
         log.info('The voice handshake is being terminated for Channel ID %s (Guild ID %s)', channel_id, guild_id)
         if remove:
@@ -194,8 +195,13 @@ class VoiceClient:
                         'If timeout occurred considering raising the timeout and reconnecting.')
             return
 
-        self.endpoint = endpoint.replace(':80', '')
-        self.endpoint_ip = socket.gethostbyname(self.endpoint)
+        self.endpoint, _, _ = endpoint.rpartition(':')
+        if self.endpoint.startswith('wss://'):
+            # Just in case, strip it off since we're going to add it later
+            self.endpoint = self.endpoint[6:]
+
+        # This gets set later
+        self.endpoint_ip = None
 
         if self.socket:
             try:
@@ -209,10 +215,32 @@ class VoiceClient:
         if self._handshake_complete.is_set():
             # terminate the websocket and handle the reconnect loop if necessary.
             self._handshake_complete.clear()
+            self._handshaking = False
             await self.ws.close(4000)
             return
 
         self._handshake_complete.set()
+
+    @property
+    def latency(self):
+        """:class:`float`: Latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds.
+
+        This could be referred to as the Discord Voice WebSocket latency and is
+        an analogue of user's voice latencies as seen in the Discord client.
+
+        .. versionadded:: 1.4
+        """
+        ws = self.ws
+        return float("inf") if not ws else ws.latency
+
+    @property
+    def average_latency(self):
+        """:class:`float`: Average of most recent 20 HEARTBEAT latencies in seconds.
+
+        .. versionadded:: 1.4
+        """
+        ws = self.ws
+        return float("inf") if not ws else ws.average_latency
 
     async def connect(self, *, reconnect=True, _tries=0, do_handshake=True):
         log.info('Connecting to voice...')
@@ -393,8 +421,10 @@ class VoiceClient:
     def _encrypt_xsalsa20_poly1305_lite(self, header, data):
         box = nacl.secret.SecretBox(bytes(self.secret_key))
         nonce = bytearray(24)
-        self.checked_add('_nonce', 1, 4294967295)
-        nonce[:4] = self._nonce.to_bytes(4, 'big')
+
+        
+        nonce[:4] = struct.pack('>I', self._lite_nonce)
+        self.checked_add('_lite_nonce', 1, 4294967295)
 
         return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
 
@@ -452,7 +482,7 @@ class VoiceClient:
             The audio source we're reading from.
         after: Callable[[:class:`Exception`], Any]
             The finalizer that is called after the stream is exhausted.
-            This function must have a single parameter, ``error``, that 
+            This function must have a single parameter, ``error``, that
             denotes an optional exception that was raised during playing.
 
         Raises
