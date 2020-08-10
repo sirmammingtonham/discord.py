@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -24,7 +24,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
 
-from discord.errors import DiscordException
+from discord.errors import ClientException, DiscordException
 
 
 __all__ = (
@@ -34,12 +34,14 @@ __all__ = (
     'PrivateMessageOnly',
     'NoPrivateMessage',
     'CheckFailure',
+    'CheckAnyFailure',
     'CommandNotFound',
     'DisabledCommand',
     'CommandInvokeError',
     'TooManyArguments',
     'UserInputError',
     'CommandOnCooldown',
+    'MaxConcurrencyReached',
     'NotOwner',
     'MissingRole',
     'BotMissingRole',
@@ -60,6 +62,7 @@ __all__ = (
     'NoEntryPointError',
     'ExtensionFailed',
     'ExtensionNotFound',
+    'CommandRegistrationError',
 )
 
 class CommandError(DiscordException):
@@ -88,7 +91,7 @@ class ConversionError(CommandError):
     ----------
     converter: :class:`discord.ext.commands.Converter`
         The converter that failed.
-    original
+    original: :exc:`Exception`
         The original exception that was raised. You can also get this via
         the ``__cause__`` attribute.
     """
@@ -152,6 +155,26 @@ class CheckFailure(CommandError):
     This inherits from :exc:`CommandError`
     """
     pass
+
+class CheckAnyFailure(CheckFailure):
+    """Exception raised when all predicates in :func:`check_any` fail.
+
+    This inherits from :exc:`CheckFailure`.
+
+    .. versionadded:: 1.3
+
+    Attributes
+    ------------
+    errors: List[:class:`CheckFailure`]
+        A list of errors that were caught during execution.
+    checks: List[Callable[[:class:`Context`], :class:`bool`]]
+        A list of check predicates that failed.
+    """
+
+    def __init__(self, checks, errors):
+        self.checks = checks
+        self.errors = errors
+        super().__init__('You do not have permission to run this command.')
 
 class PrivateMessageOnly(CheckFailure):
     """Exception raised when an operation does not work outside of private
@@ -219,12 +242,34 @@ class CommandOnCooldown(CommandError):
         self.retry_after = retry_after
         super().__init__('You are on cooldown. Try again in {:.2f}s'.format(retry_after))
 
+class MaxConcurrencyReached(CommandError):
+    """Exception raised when the command being invoked has reached its maximum concurrency.
+
+    This inherits from :exc:`CommandError`.
+
+    Attributes
+    ------------
+    number: :class:`int`
+        The maximum number of concurrent invokers allowed.
+    per: :class:`BucketType`
+        The bucket type passed to the :func:`.max_concurrency` decorator.
+    """
+
+    def __init__(self, number, per):
+        self.number = number
+        self.per = per
+        name = per.name
+        suffix = 'per %s' % name if per.name != 'default' else 'globally'
+        plural = '%s times %s' if number > 1 else '%s time %s'
+        fmt = plural % (number, suffix)
+        super().__init__('Too many people using this command. It can only be used {} concurrently.'.format(fmt))
+
 class MissingRole(CheckFailure):
     """Exception raised when the command invoker lacks a role to run a command.
 
     This inherits from :exc:`CheckFailure`
 
-    .. versionadded:: 1.1.0
+    .. versionadded:: 1.1
 
     Attributes
     -----------
@@ -242,7 +287,7 @@ class BotMissingRole(CheckFailure):
 
     This inherits from :exc:`CheckFailure`
 
-    .. versionadded:: 1.1.0
+    .. versionadded:: 1.1
 
     Attributes
     -----------
@@ -261,7 +306,7 @@ class MissingAnyRole(CheckFailure):
 
     This inherits from :exc:`CheckFailure`
 
-    .. versionadded:: 1.1.0
+    .. versionadded:: 1.1
 
     Attributes
     -----------
@@ -289,7 +334,7 @@ class BotMissingAnyRole(CheckFailure):
 
     This inherits from :exc:`CheckFailure`
 
-    .. versionadded:: 1.1.0
+    .. versionadded:: 1.1
 
     Attributes
     -----------
@@ -316,7 +361,7 @@ class NSFWChannelRequired(CheckFailure):
 
     This inherits from :exc:`CheckFailure`.
 
-    .. versionadded:: 1.1.0
+    .. versionadded:: 1.1
 
     Parameters
     -----------
@@ -525,7 +570,7 @@ class ExtensionNotFound(ExtensionError):
 
     This inherits from :exc:`ExtensionError`
 
-    .. versionchanged:: 1.3.0
+    .. versionchanged:: 1.3
         Made the ``original`` attribute always None.
 
     Attributes
@@ -539,3 +584,24 @@ class ExtensionNotFound(ExtensionError):
         self.original = None
         fmt = 'Extension {0!r} could not be loaded.'
         super().__init__(fmt.format(name), name=name)
+
+class CommandRegistrationError(ClientException):
+    """An exception raised when the command can't be added
+    because the name is already taken by a different command.
+
+    This inherits from :exc:`discord.ClientException`
+
+    .. versionadded:: 1.4
+
+    Attributes
+    ----------
+    name: :class:`str`
+        The command name that had the error.
+    alias_conflict: :class:`bool`
+        Whether the name that conflicts is an alias of the command we try to add.
+    """
+    def __init__(self, name, *, alias_conflict=False):
+        self.name = name
+        self.alias_conflict = alias_conflict
+        type_ = 'alias' if alias_conflict else 'command'
+        super().__init__('The {} {} is already an existing command or alias.'.format(type_, name))

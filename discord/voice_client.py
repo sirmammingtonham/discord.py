@@ -3,7 +3,7 @@
 """
 The MIT License (MIT)
 
-Copyright (c) 2015-2019 Rapptz
+Copyright (c) 2015-2020 Rapptz
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
@@ -50,13 +50,15 @@ from .backoff import ExponentialBackoff
 from .gateway import *
 from .errors import ClientException, ConnectionClosed
 from .player import AudioPlayer, AudioSource
+from .reader import AudioReader, AudioSink
+from .utils import Bidict
+from .speakingstate import SpeakingState
 
 try:
     import nacl.secret
     has_nacl = True
 except ImportError:
     has_nacl = False
-
 
 log = logging.getLogger(__name__)
 
@@ -103,17 +105,24 @@ class VoiceClient:
         self._handshaking = False
         self._handshake_check = asyncio.Lock()
         self._handshake_complete = asyncio.Event()
+        # this will be used in the AudioReader thread
+        self._connecting = threading.Condition()
 
-        self.mode = None
+        self._mode = None
         self._connections = 0
         self.sequence = 0
         self.timestamp = 0
+        self._nonce = 0
         self._runner = None
         self._player = None
+        self._reader = None
         self.encoder = None
+        self._ssrcs = Bidict()
+        self._lite_nonce = 0
 
     warn_nacl = not has_nacl
     supported_modes = (
+        'xsalsa20_poly1305_lite',
         'xsalsa20_poly1305_suffix',
         'xsalsa20_poly1305',
     )
@@ -160,6 +169,7 @@ class VoiceClient:
         guild_id, channel_id = self.channel._get_voice_state_pair()
         self._handshake_complete.clear()
         await self.main_ws.voice_state(guild_id, None, self_mute=True)
+        self._handshaking = False
 
         log.info('The voice handshake is being terminated for Channel ID %s (Guild ID %s)', channel_id, guild_id)
         if remove:
@@ -185,8 +195,13 @@ class VoiceClient:
                         'If timeout occurred considering raising the timeout and reconnecting.')
             return
 
-        self.endpoint = endpoint.replace(':80', '')
-        self.endpoint_ip = socket.gethostbyname(self.endpoint)
+        self.endpoint, _, _ = endpoint.rpartition(':')
+        if self.endpoint.startswith('wss://'):
+            # Just in case, strip it off since we're going to add it later
+            self.endpoint = self.endpoint[6:]
+
+        # This gets set later
+        self.endpoint_ip = None
 
         if self.socket:
             try:
@@ -200,10 +215,32 @@ class VoiceClient:
         if self._handshake_complete.is_set():
             # terminate the websocket and handle the reconnect loop if necessary.
             self._handshake_complete.clear()
+            self._handshaking = False
             await self.ws.close(4000)
             return
 
         self._handshake_complete.set()
+
+    @property
+    def latency(self):
+        """:class:`float`: Latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds.
+
+        This could be referred to as the Discord Voice WebSocket latency and is
+        an analogue of user's voice latencies as seen in the Discord client.
+
+        .. versionadded:: 1.4
+        """
+        ws = self.ws
+        return float("inf") if not ws else ws.latency
+
+    @property
+    def average_latency(self):
+        """:class:`float`: Average of most recent 20 HEARTBEAT latencies in seconds.
+
+        .. versionadded:: 1.4
+        """
+        ws = self.ws
+        return float("inf") if not ws else ws.average_latency
 
     async def connect(self, *, reconnect=True, _tries=0, do_handshake=True):
         log.info('Connecting to voice...')
@@ -303,9 +340,59 @@ class VoiceClient:
         """Indicates if the voice client is connected to voice."""
         return self._connected.is_set()
 
+    async def speak(self, state):
+        """|coro|
+
+        Sets the bot's speaking state.
+        [maybe note about how the bot does this while playing audio so
+        you probably dont need to call this]
+
+        Parameters
+        -----------
+        state: :class:`SpeakingState`
+            The state to set the bot to.
+        """
+
+        if not isinstance(state, SpeakingState):
+            raise TypeError("state must be a SpeakingState not %s" % state.__class__.__name__)
+
+        await self.ws.speak(state)
+
     # audio related
 
-    def _get_voice_packet(self, data):
+    def _add_ssrc(self, user_id, ssrc):
+        """Adds a user_id<->ssrc mapping.
+
+        Technically these can be added in either order, but using user_id as the key
+        is preferable since, should we be updating a mapping instead of adding one, we
+        want to update the ssrc for the user_id, not the other way around.
+
+        I think?  Did I write it to work like that?
+        """
+        self._ssrcs[user_id] = ssrc
+
+    def _remove_ssrc(self, *, ssrc=None, user_id=None):
+        """Removes a user_id<->ssrc mapping.  Either one can be used as the key."""
+
+        thing = ssrc or user_id
+        if not thing:
+            raise TypeError("must provide at least one argument")
+
+        other_thing = self._ssrcs.pop(thing, None)
+        if self._reader:
+            self._reader._ssrc_removed(ssrc or other_thing)
+
+    def _get_ssrc_mapping(self, *, ssrc=None, user_id=None):
+        """Returns a (ssrc, user_id) tuple from the given input.  At least one argument is required."""
+
+        thing = ssrc or user_id
+        if not thing:
+            raise TypeError("must provide at least one argument")
+
+        other_thing = self._ssrcs.get(thing)
+        return ssrc or other_thing, user_id or other_thing
+
+    def _encrypt_voice_packet(self, data):
         header = bytearray(12)
 
         # Formulate rtp header
@@ -315,7 +402,7 @@ class VoiceClient:
         struct.pack_into('>I', header, 4, self.timestamp)
         struct.pack_into('>I', header, 8, self.ssrc)
 
-        encrypt_packet = getattr(self, '_encrypt_' + self.mode)
+        encrypt_packet = getattr(self, '_encrypt_' + self._mode)
         return encrypt_packet(header, data)
 
     def _encrypt_xsalsa20_poly1305(self, header, data):
@@ -330,6 +417,54 @@ class VoiceClient:
         nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
 
         return header + box.encrypt(bytes(data), nonce).ciphertext + nonce
+
+    def _encrypt_xsalsa20_poly1305_lite(self, header, data):
+        box = nacl.secret.SecretBox(bytes(self.secret_key))
+        nonce = bytearray(24)
+
+        
+        nonce[:4] = struct.pack('>I', self._lite_nonce)
+        self.checked_add('_lite_nonce', 1, 4294967295)
+
+        return header + box.encrypt(bytes(data), bytes(nonce)).ciphertext + nonce[:4]
+
+    def send_audio_packet(self, data, *, encode=True):
+        """Sends an audio packet composed of the data.
+
+        You must be connected to play audio.
+
+        Parameters
+        ----------
+        data: :class:`bytes`
+            The :term:`py:bytes-like object` denoting PCM or Opus voice data.
+        encode: :class:`bool`
+            Indicates if ``data`` should be encoded into Opus.
+
+        Raises
+        -------
+        ClientException
+            You are not connected.
+        opus.OpusError
+            Encoding the data failed.
+        """
+
+        self.checked_add('sequence', 1, 65535)
+        if encode:
+            if self.encoder is None:
+                self.encoder = opus.Encoder()
+
+            encoded_data = self.encoder.encode(data, opus.Encoder.SAMPLES_PER_FRAME)
+        else:
+            encoded_data = data
+        packet = self._encrypt_voice_packet(encoded_data)
+        try:
+            self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
+        except BlockingIOError:
+            log.warning('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
+
+        self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+
+    # send api related
 
     def play(self, source, *, after=None):
         """Plays an :class:`AudioSource`.
@@ -347,7 +482,7 @@ class VoiceClient:
             The audio source we're reading from.
         after: Callable[[:class:`Exception`], Any]
             The finalizer that is called after the stream is exhausted.
-            This function must have a single parameter, ``error``, that 
+            This function must have a single parameter, ``error``, that
             denotes an optional exception that was raised during playing.
 
         Raises
@@ -367,7 +502,7 @@ class VoiceClient:
             raise ClientException('Already playing audio.')
 
         if not isinstance(source, AudioSource):
-            raise TypeError('source must an AudioSource not {0.__class__.__name__}'.format(source))
+            raise TypeError('source must be an AudioSource not {0.__class__.__name__}'.format(source))
 
         if not self.encoder and not source.is_opus():
             self.encoder = opus.Encoder()
@@ -383,7 +518,7 @@ class VoiceClient:
         """Indicates if we're playing audio, but if we're paused."""
         return self._player is not None and self._player.is_paused()
 
-    def stop(self):
+    def stop_playing(self):
         """Stops playing audio."""
         if self._player:
             self._player.stop()
@@ -417,35 +552,51 @@ class VoiceClient:
 
         self._player._set_source(value)
 
-    def send_audio_packet(self, data, *, encode=True):
-        """Sends an audio packet composed of the data.
+    # receive api related
 
-        You must be connected to play audio.
+    def listen(self, sink):
+        """Receives audio into a :class:`AudioSink`. TODO: wording
 
-        Parameters
-        ----------
-        data: :class:`bytes`
-            The :term:`py:bytes-like object` denoting PCM or Opus voice data.
-        encode: :class:`bool`
-            Indicates if ``data`` should be encoded into Opus.
-
-        Raises
-        -------
-        ClientException
-            You are not connected.
-        opus.OpusError
-            Encoding the data failed.
+        TODO: the rest of it
         """
 
-        self.checked_add('sequence', 1, 65535)
-        if encode:
-            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
-        else:
-            encoded_data = data
-        packet = self._get_voice_packet(encoded_data)
-        try:
-            self.socket.sendto(packet, (self.endpoint_ip, self.voice_port))
-        except BlockingIOError:
-            log.warning('A packet has been dropped (seq: %s, timestamp: %s)', self.sequence, self.timestamp)
+        if not self.is_connected():
+            raise ClientException('Not connected to voice.')
 
-        self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+        if not isinstance(sink, AudioSink):
+            raise TypeError('sink must be an AudioSink not {0.__class__.__name__}'.format(sink))
+
+        if self.is_listening():
+            raise ClientException('Already receiving audio.')
+
+        self._reader = AudioReader(sink, self)
+        self._reader.start()
+
+    def is_listening(self):
+        """Indicates if we're currently receiving audio."""
+        return self._reader is not None and self._reader.is_listening()
+
+    def stop_listening(self):
+        """Stops receiving audio."""
+        if self._reader:
+            self._reader.stop()
+            self._reader = None
+
+    @property
+    def sink(self):
+        return self._reader.sink if self._reader else None
+
+    @sink.setter
+    def sink(self, value):
+        if not isinstance(value, AudioSink):
+            raise TypeError('expected AudioSink not {0.__class__.__name__}.'.format(value))
+
+        if self._reader is None:
+            raise ValueError('Not receiving anything.')
+
+        self._reader._set_sink(sink)
+
+    def stop(self):
+        """Stops playing and receiving audio."""
+        self.stop_playing()
+        self.stop_listening()
