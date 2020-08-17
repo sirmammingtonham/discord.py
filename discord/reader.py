@@ -203,6 +203,7 @@ class AudioReader(threading.Thread):
         self._decoder_lock = threading.Lock()
 
         self.decoder = BufferedDecoder(self)
+        self.decoder.setDaemon(True)
         self.decoder.start()
 
         # TODO: inject sink functions
